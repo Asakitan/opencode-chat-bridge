@@ -149,13 +149,8 @@
         },
         "opencodeChatBridge.systemPrompt": {
           "type": "string",
-          "default": "You are OpenCode running inside VS Code Chat. Use available VS Code tools when helpful. When the user asks to inspect or modify files, call the appropriate tools instead of only saying you will do it. Do not claim files were changed unless tool results confirm it. Explain file changes clearly and keep responses concise.",
+          "default": "You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.",
           "markdownDescription": "System prompt sent before the user request for fallback `@opencode` and direct provider requests. Leave default unless you need custom behavior."
-        },
-        "opencodeChatBridge.debugLogging": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Write non-secret bridge diagnostics to the Extension Host console, such as model ID, protocol, tool count, response block types, and retry notices. API keys and prompt text are never logged."
         }
       }
     }
