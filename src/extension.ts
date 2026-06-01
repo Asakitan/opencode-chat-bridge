@@ -6,6 +6,7 @@ const GO_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/complet
 const GO_MESSAGES_ENDPOINT = 'https://opencode.ai/zen/go/v1/messages';
 
 let diagnostics: BridgeDiagnostics | undefined;
+let diagnosticWriteQueue: Promise<void> = Promise.resolve();
 
 type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 type ModelProtocol = 'openai-chat' | 'anthropic-messages';
@@ -309,6 +310,7 @@ export function activate(context: vscode.ExtensionContext) {
       await config.update('diagnostics.fullPayloads', true, vscode.ConfigurationTarget.Workspace);
       await config.update('diagnostics.writeFile', true, vscode.ConfigurationTarget.Workspace);
       await config.update('diagnostics.file', '.opencode-chat-bridge/diagnostics.jsonl', vscode.ConfigurationTarget.Workspace);
+      await clearDiagnosticsFile(getSettings().diagnosticsFile);
       vscode.window.showInformationMessage('OpenCode Chat Bridge full diagnostics enabled. Model responses, tool calls, and tool results will be written to .opencode-chat-bridge/diagnostics.jsonl. API keys are still redacted.');
     })
   );
@@ -607,7 +609,7 @@ function createDiagnostics(context: vscode.ExtensionContext): BridgeDiagnostics 
       const suffix = data !== undefined ? ` ${safeJsonStringify(payload)}` : '';
       const timestamp = new Date().toISOString();
       channel.appendLine(`[${timestamp}] ${message}${suffix}`);
-      void writeDiagnosticFile(settings, {
+      enqueueDiagnosticFileWrite(settings, {
         timestamp,
         event: message,
         full,
@@ -615,6 +617,14 @@ function createDiagnostics(context: vscode.ExtensionContext): BridgeDiagnostics 
       });
     }
   };
+}
+
+function enqueueDiagnosticFileWrite(settings: BridgeSettings, entry: Record<string, unknown>): void {
+  diagnosticWriteQueue = diagnosticWriteQueue
+    .then(() => writeDiagnosticFile(settings, entry))
+    .catch(error => {
+      diagnostics?.channel.appendLine(`[${new Date().toISOString()}] diagnostics.writeFile.queueError ${error instanceof Error ? error.message : String(error)}`);
+    });
 }
 
 async function writeDiagnosticFile(settings: BridgeSettings, entry: Record<string, unknown>): Promise<void> {
@@ -635,7 +645,7 @@ async function writeDiagnosticFile(settings: BridgeSettings, entry: Record<strin
 
   try {
     await vscode.workspace.fs.createDirectory(parent);
-    const line = `${safeJsonStringify(entry)}\n`;
+    const line = `${JSON.stringify(entry)}\n`;
     const existing = await readExistingDiagnosticFile(target);
     await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(`${existing}${line}`));
   } catch (error) {
@@ -649,6 +659,19 @@ async function readExistingDiagnosticFile(uri: vscode.Uri): Promise<string> {
   } catch {
     return '';
   }
+}
+
+async function clearDiagnosticsFile(relativePath: string): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) {
+    return;
+  }
+
+  const segments = relativePath.replace(/^[/\\]+/, '').split(/[\\/]+/).filter(Boolean);
+  const target = vscode.Uri.joinPath(folder.uri, ...segments);
+  const parent = vscode.Uri.joinPath(folder.uri, ...segments.slice(0, -1));
+  await vscode.workspace.fs.createDirectory(parent);
+  await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(''));
 }
 
 function diag(message: string, data?: unknown, options?: { full?: boolean }): void {
