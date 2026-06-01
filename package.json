@@ -1,0 +1,170 @@
+{
+  "name": "opencode-chat-bridge",
+  "displayName": "OpenCode Chat Bridge",
+  "description": "Use OpenCode Go and Zen models from VS Code Chat with VS Code tool support.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onChatParticipant:opencode-chat-bridge.opencode",
+    "onLanguageModelChatProvider:opencode"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeChatBridge",
+          "title": "OpenCode",
+          "icon": "media/opencode.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeChatBridge": [
+        {
+          "type": "webview",
+          "id": "opencodeChatBridge.welcome",
+          "name": "Bridge"
+        }
+      ]
+    },
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "OpenCode Go / Zen",
+        "managementCommand": "opencodeChatBridge.setApiKey"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "opencode-chat-bridge.opencode",
+        "name": "opencode",
+        "fullName": "OpenCode",
+        "description": "Ask OpenCode from VS Code Chat.",
+        "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "opencodeChatBridge.setApiKey",
+        "title": "OpenCode Chat Bridge: Set API Key"
+      },
+      {
+        "command": "opencodeChatBridge.clearApiKey",
+        "title": "OpenCode Chat Bridge: Clear API Key"
+      },
+      {
+        "command": "opencodeChatBridge.openChat",
+        "title": "OpenCode Chat Bridge: Open Chat"
+      },
+      {
+        "command": "opencodeChatBridge.showRunHelp",
+        "title": "OpenCode Chat Bridge: Show Run Help"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode Chat Bridge",
+      "properties": {
+        "opencodeChatBridge.endpoint": {
+          "type": "string",
+          "default": "https://opencode.ai/zen/go/v1/chat/completions",
+          "enum": [
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            "https://opencode.ai/zen/v1/chat/completions"
+          ],
+          "enumDescriptions": [
+            "OpenCode Go OpenAI-compatible endpoint. Use for fallback @opencode with Kimi, GLM, DeepSeek, or MiMo Go models.",
+            "OpenCode Zen OpenAI-compatible endpoint. Use for fallback @opencode with Zen or Zen free models."
+          ],
+          "description": "Fallback @opencode OpenAI-compatible endpoint. The model provider ignores this and uses built-in per-model Go/Zen endpoints."
+        },
+        "opencodeChatBridge.model": {
+          "type": "string",
+          "default": "kimi-k2.6",
+          "enum": [
+            "kimi-k2.6",
+            "kimi-k2.5",
+            "glm-5.1",
+            "glm-5",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "mimo-v2.5-pro",
+            "mimo-v2.5",
+            "big-pickle",
+            "mimo-v2.5-free",
+            "nemotron-3-super-free",
+            "deepseek-v4-flash-free"
+          ],
+          "enumItemLabels": [
+            "OpenCode Go: Kimi K2.6",
+            "OpenCode Go: Kimi K2.5",
+            "OpenCode Go: GLM-5.1",
+            "OpenCode Go: GLM-5",
+            "OpenCode Go: DeepSeek V4 Pro",
+            "OpenCode Go: DeepSeek V4 Flash",
+            "OpenCode Go: MiMo-V2.5-Pro",
+            "OpenCode Go: MiMo-V2.5",
+            "OpenCode Zen Free: Big Pickle",
+            "OpenCode Zen Free: MiMo V2.5 Free",
+            "OpenCode Zen Free: Nemotron 3 Super Free",
+            "OpenCode Zen Free: DeepSeek V4 Flash Free"
+          ],
+          "enumDescriptions": [
+            "Go /chat/completions, context 262144, output 65536.",
+            "Go /chat/completions, context 262144, output 65536.",
+            "Go /chat/completions, context 202752, output 32768.",
+            "Go /chat/completions, context 202752, output 32768.",
+            "Go /chat/completions, context 1000000, output 384000.",
+            "Go /chat/completions, context 1000000, output 384000.",
+            "Go /chat/completions, context 1048576, output 128000.",
+            "Go /chat/completions, context 1000000, output 128000.",
+            "Zen free /chat/completions, context 200000, output 32000.",
+            "Zen free /chat/completions, context 200000, output 32000.",
+            "Zen free /chat/completions, context 204800, output 128000.",
+            "Zen free /chat/completions, context 200000, output 128000."
+          ],
+          "description": "Fallback @opencode model ID and sidebar highlight. The proper Chat model picker exposes Go models, Anthropic Go models, and Zen free models separately."
+        },
+        "opencodeChatBridge.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "markdownDescription": "Sampling temperature sent to OpenCode. Lower values are more deterministic; higher values are more creative."
+        },
+        "opencodeChatBridge.maxToolRounds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Maximum tool-call round trips per chat request."
+        },
+        "opencodeChatBridge.systemPrompt": {
+          "type": "string",
+          "default": "You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.",
+          "markdownDescription": "System prompt sent before the user request for fallback `@opencode` and direct provider requests. Leave default unless you need custom behavior."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/vscode": "^1.101.0",
+    "@vscode/vsce": "^3.3.2",
+    "typescript": "^5.8.3"
+  }
+}
