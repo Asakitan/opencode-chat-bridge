@@ -50,6 +50,7 @@ type BridgeSettings = {
   temperature: number;
   maxToolRounds: number;
   systemPrompt: string;
+  debugLogging: boolean;
 };
 
 type ToolInfo = {
@@ -88,6 +89,7 @@ type AnthropicContentBlock =
 type AnthropicResponse = {
   content?: Array<{ type?: string; text?: string; id?: string; name?: string; input?: unknown }>;
   error?: { message?: string; type?: string };
+  stop_reason?: string;
 };
 
 type AnthropicRequestMessages = {
@@ -97,6 +99,12 @@ type AnthropicRequestMessages = {
 
 type AnthropicMessagesOptions = {
   toolChoice?: unknown;
+};
+
+type AnthropicTool = {
+  name: string;
+  description: string;
+  input_schema: unknown;
 };
 
 const OPEN_CODE_MODELS: OpenCodeModelInfo[] = [
@@ -405,10 +413,13 @@ async function provideOpenCodeLanguageModelResponse(
   const languageModelTools = options.tools ?? [];
   const toolNameMap = new Map(languageModelTools.map(tool => [sanitizeToolName(tool.name), tool.name]));
 
+  debugLog(settings, `provider request model=${modelInfo.id} protocol=${modelInfo.protocol} tools=${languageModelTools.length} toolMode=${String(options.toolMode)}`);
+
   if (modelInfo.protocol === 'anthropic-messages') {
     const anthropicMessages = toAnthropicMessages(messages);
     const tools = languageModelTools.map(toAnthropicToolFromLanguageModelTool);
-    const response = await callAnthropicMessages(modelInfo, settings, apiKey, anthropicMessages, tools, token, {
+    const anthropicRequest = withAnthropicSystemPrompt(anthropicMessages, settings.systemPrompt);
+    const response = await callAnthropicMessages(modelInfo, settings, apiKey, anthropicRequest, tools, token, {
       toolChoice: toAnthropicToolChoice(options.toolMode)
     });
 
@@ -416,13 +427,15 @@ async function provideOpenCodeLanguageModelResponse(
       throw new Error('No assistant content was returned by OpenCode Go.');
     }
 
+    debugLog(settings, `anthropic response blocks=${response.content.map(block => block?.type ?? 'unknown').join(',') || 'none'} stopReason=${response.stop_reason ?? 'unknown'}`);
+
     for (const block of response.content) {
       if (block?.type === 'text' && typeof block.text === 'string') {
         progress.report(new vscode.LanguageModelTextPart(block.text));
       }
 
       if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        const originalToolName = toolNameMap.get(block.name) ?? block.name;
+        const originalToolName = resolveOriginalToolName(block.name, toolNameMap);
         progress.report(new vscode.LanguageModelToolCallPart(
           block.id,
           originalToolName,
@@ -434,7 +447,7 @@ async function provideOpenCodeLanguageModelResponse(
     return;
   }
 
-  const openAiMessages = messages.flatMap(toOpenAiMessages);
+  const openAiMessages = withOpenAiSystemPrompt(messages.flatMap(toOpenAiMessages), settings.systemPrompt);
   const tools = languageModelTools.map(toOpenAiToolFromLanguageModelTool);
   const response = await callChatCompletions(
     { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
@@ -453,12 +466,14 @@ async function provideOpenCodeLanguageModelResponse(
     throw new Error('No assistant message was returned by OpenCode.');
   }
 
+  debugLog(settings, `openai response toolCalls=${assistantMessage.tool_calls?.length ?? 0} finishReason=${response.choices?.[0]?.finish_reason ?? 'unknown'}`);
+
   if (assistantMessage.content) {
     progress.report(new vscode.LanguageModelTextPart(assistantMessage.content));
   }
 
   for (const toolCall of assistantMessage.tool_calls ?? []) {
-    const originalToolName = toolNameMap.get(toolCall.function.name) ?? toolCall.function.name;
+    const originalToolName = resolveOriginalToolName(toolCall.function.name, toolNameMap);
     progress.report(new vscode.LanguageModelToolCallPart(
       toolCall.id || `call_${Date.now().toString(36)}`,
       originalToolName,
@@ -480,7 +495,44 @@ function getSettings(): BridgeSettings {
     model: config.get<string>('model', 'kimi-k2.6'),
     temperature: config.get<number>('temperature', 0.2),
     maxToolRounds: config.get<number>('maxToolRounds', 5),
-    systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.')
+    systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available VS Code tools when helpful. When the user asks to inspect or modify files, call the appropriate tools instead of only saying you will do it. Do not claim files were changed unless tool results confirm it. Explain file changes clearly and keep responses concise.'),
+    debugLogging: config.get<boolean>('debugLogging', false)
+  };
+}
+
+function debugLog(settings: BridgeSettings, message: string): void {
+  if (settings.debugLogging) {
+    console.log(`[OpenCode Chat Bridge] ${message}`);
+  }
+}
+
+function resolveOriginalToolName(callName: string, toolNameMap: Map<string, string>): string {
+  return toolNameMap.get(callName) ?? toolNameMap.get(sanitizeToolName(callName)) ?? callName;
+}
+
+function withOpenAiSystemPrompt(messages: OpenAiMessage[], systemPrompt: string): OpenAiMessage[] {
+  const prompt = systemPrompt.trim();
+  if (!prompt) {
+    return messages;
+  }
+
+  const [first, ...rest] = messages;
+  if (first?.role === 'system') {
+    return [{ ...first, content: [prompt, first.content].filter(Boolean).join('\n\n') }, ...rest];
+  }
+
+  return [{ role: 'system', content: prompt }, ...messages];
+}
+
+function withAnthropicSystemPrompt(request: AnthropicRequestMessages, systemPrompt: string): AnthropicRequestMessages {
+  const prompt = systemPrompt.trim();
+  if (!prompt) {
+    return request;
+  }
+
+  return {
+    system: [prompt, ...request.system],
+    messages: request.messages
   };
 }
 
@@ -679,7 +731,7 @@ async function callAnthropicMessages(
   settings: BridgeSettings,
   apiKey: string,
   requestMessages: AnthropicRequestMessages,
-  tools: Array<{ name: string; description: string; input_schema: unknown }>,
+  tools: AnthropicTool[],
   token: vscode.CancellationToken,
   options: AnthropicMessagesOptions = {}
 ): Promise<AnthropicResponse> {
@@ -687,57 +739,184 @@ async function callAnthropicMessages(
   const disposable = token.onCancellationRequested(() => abort.abort());
 
   try {
-    const body: Record<string, unknown> = {
-      model: modelInfo.id,
-      max_tokens: modelInfo.maxOutputTokens,
-      temperature: settings.temperature,
-      messages: requestMessages.messages,
-      stream: false
-    };
-
-    if (requestMessages.system.length) {
-      body.system = requestMessages.system.join('\n');
+    const firstAttempt = await postAnthropicMessages(modelInfo, settings, apiKey, requestMessages, tools, abort.signal, options);
+    if (firstAttempt.ok) {
+      return firstAttempt.parsed;
     }
 
-    if (tools.length) {
-      body.tools = tools;
-      if (options.toolChoice !== undefined) {
-        body.tool_choice = options.toolChoice;
+    if (shouldRetryAnthropicWithReducedPrompt(firstAttempt.status, firstAttempt.parsed, firstAttempt.text)) {
+      debugLog(settings, 'anthropic request hit input-content filter; retrying once with reduced system prompt and tool descriptions');
+      const retryAttempt = await postAnthropicMessages(
+        modelInfo,
+        settings,
+        apiKey,
+        reduceAnthropicRequest(requestMessages),
+        reduceAnthropicTools(tools),
+        abort.signal,
+        options
+      );
+
+      if (retryAttempt.ok) {
+        return retryAttempt.parsed;
       }
+
+      throw endpointError(retryAttempt.status, retryAttempt.parsed, retryAttempt.text, retryAttempt.statusText, 'Reduced Anthropic retry also failed');
     }
 
-    const response = await fetch(modelInfo.endpoint, {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: abort.signal
-    });
-
-    const text = await response.text();
-    let parsed: AnthropicResponse;
-    try {
-      parsed = text ? JSON.parse(text) as AnthropicResponse : {};
-    } catch {
-      throw new Error(`Endpoint returned non-JSON response (${response.status}): ${text.slice(0, 500)}`);
-    }
-
-    if (!response.ok) {
-      const errorMessage = parsed.error?.message ?? text.slice(0, 500) ?? response.statusText;
-      throw new Error(`Endpoint returned ${response.status}: ${errorMessage}`);
-    }
-
-    if (parsed.error) {
-      throw new Error(parsed.error.message ?? JSON.stringify(parsed.error));
-    }
-
-    return parsed;
+    throw endpointError(firstAttempt.status, firstAttempt.parsed, firstAttempt.text, firstAttempt.statusText);
   } finally {
     disposable.dispose();
   }
+}
+
+async function postAnthropicMessages(
+  modelInfo: OpenCodeModelInfo,
+  settings: BridgeSettings,
+  apiKey: string,
+  requestMessages: AnthropicRequestMessages,
+  tools: AnthropicTool[],
+  signal: AbortSignal,
+  options: AnthropicMessagesOptions = {}
+): Promise<{ ok: boolean; status: number; statusText: string; text: string; parsed: AnthropicResponse }> {
+  const body: Record<string, unknown> = {
+    model: modelInfo.id,
+    max_tokens: modelInfo.maxOutputTokens,
+    temperature: settings.temperature,
+    messages: requestMessages.messages,
+    stream: false
+  };
+
+  if (requestMessages.system.length) {
+    body.system = requestMessages.system.join('\n');
+  }
+
+  if (tools.length) {
+    body.tools = tools;
+    if (options.toolChoice !== undefined) {
+      body.tool_choice = options.toolChoice;
+    }
+  }
+
+  const response = await fetch(modelInfo.endpoint, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+
+  const text = await response.text();
+  let parsed: AnthropicResponse;
+  try {
+    parsed = text ? JSON.parse(text) as AnthropicResponse : {};
+  } catch {
+    throw new Error(`Endpoint returned non-JSON response (${response.status}): ${text.slice(0, 500)}`);
+  }
+
+  if (parsed.error && response.ok) {
+    throw new Error(parsed.error.message ?? JSON.stringify(parsed.error));
+  }
+
+  return { ok: response.ok && !parsed.error, status: response.status, statusText: response.statusText, text, parsed };
+}
+
+function shouldRetryAnthropicWithReducedPrompt(status: number, parsed: AnthropicResponse, text: string): boolean {
+  if (status !== 400) {
+    return false;
+  }
+
+  const message = `${parsed.error?.message ?? ''}\n${text}`.toLowerCase();
+  return message.includes('inappropriate content') || message.includes('input text data');
+}
+
+function reduceAnthropicRequest(request: AnthropicRequestMessages): AnthropicRequestMessages {
+  return {
+    system: ['You are a VS Code coding model. Use tools for file reads and edits. Keep outputs concise.'],
+    messages: buildMinimalAnthropicRetryMessages(request.messages)
+  };
+}
+
+function buildMinimalAnthropicRetryMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
+  const conversationTail = messages.slice(-6).map(message => ({
+    role: message.role,
+    content: message.content
+      .filter(block => block.type !== 'text' || !looksLikeInjectedInstruction(block.text))
+      .map(reduceAnthropicContentBlock)
+  })).filter(message => message.content.length);
+
+  const lastUserText = findLastUserText(messages);
+  if (!lastUserText) {
+    return conversationTail.length ? conversationTail : [{ role: 'user', content: [{ type: 'text', text: 'Continue the coding task using available VS Code tools.' }] }];
+  }
+
+  const userReminder: AnthropicMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: lastUserText }]
+  };
+
+  if (!conversationTail.length) {
+    return [userReminder];
+  }
+
+  const tailAlreadyHasUserText = conversationTail.some(message => message.role === 'user' && message.content.some(block => block.type === 'text' && block.text === lastUserText));
+  return mergeAdjacentAnthropicMessages(tailAlreadyHasUserText ? conversationTail : [...conversationTail, userReminder]);
+}
+
+function findLastUserText(messages: AnthropicMessage[]): string | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const message = messages[messageIndex];
+    if (message.role !== 'user') {
+      continue;
+    }
+
+    for (let contentIndex = message.content.length - 1; contentIndex >= 0; contentIndex--) {
+      const block = message.content[contentIndex];
+      if (block.type === 'text' && block.text.trim() && !looksLikeInjectedInstruction(block.text)) {
+        return trimRetryText(block.text.trim());
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function looksLikeInjectedInstruction(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return normalized.startsWith('you are ') ||
+    normalized.startsWith('system:') ||
+    normalized.includes('<instructions>') ||
+    normalized.includes('<tooluseinstructions>') ||
+    normalized.includes('custom instructions') ||
+    normalized.includes('copilot-instructions');
+}
+
+function reduceAnthropicContentBlock(block: AnthropicContentBlock): AnthropicContentBlock {
+  if (block.type !== 'text') {
+    return block;
+  }
+
+  const text = trimRetryText(block.text);
+  return { type: 'text', text };
+}
+
+function trimRetryText(text: string): string {
+  return text.length > 12000 ? `${text.slice(0, 12000)}\n[message truncated by OpenCode Chat Bridge retry]` : text;
+}
+
+function reduceAnthropicTools(tools: AnthropicTool[]): AnthropicTool[] {
+  return tools.map(tool => ({
+    name: tool.name,
+    description: `VS Code tool: ${tool.name}`,
+    input_schema: normalizeJsonSchema(tool.input_schema)
+  }));
+}
+
+function endpointError(status: number, parsed: AnthropicResponse, text: string, statusText: string, prefix?: string): Error {
+  const errorMessage = parsed.error?.message ?? text.slice(0, 500) ?? statusText;
+  return new Error(`${prefix ? `${prefix}: ` : ''}Endpoint returned ${status}: ${errorMessage}`);
 }
 
 async function invokeVsCodeTool(
