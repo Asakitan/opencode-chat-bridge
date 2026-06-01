@@ -151,6 +151,20 @@
           "maximum": 20,
           "description": "Maximum tool-call round trips per chat request."
         },
+        "opencodeChatBridge.maxHistoryMessages": {
+          "type": "number",
+          "default": 40,
+          "minimum": 20,
+          "maximum": 300,
+          "markdownDescription": "Maximum converted OpenAI messages to keep when forwarding VS Code Chat history to OpenCode. Lower values reduce hangs on long tool sessions."
+        },
+        "opencodeChatBridge.maxToolResultChars": {
+          "type": "number",
+          "default": 8000,
+          "minimum": 1000,
+          "maximum": 100000,
+          "markdownDescription": "Maximum characters forwarded for each tool result in OpenAI-compatible requests. Large tool outputs are truncated with a marker to keep requests responsive."
+        },
         "opencodeChatBridge.systemPrompt": {
           "type": "string",
           "default": "You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.",

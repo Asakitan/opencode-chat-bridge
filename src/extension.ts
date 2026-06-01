@@ -63,6 +63,8 @@ type BridgeSettings = {
   model: string;
   temperature: number;
   maxToolRounds: number;
+  maxHistoryMessages: number;
+  maxToolResultChars: number;
   systemPrompt: string;
   diagnosticsEnabled: boolean;
   diagnosticsFullPayloads: boolean;
@@ -528,10 +530,14 @@ async function provideOpenCodeLanguageModelResponse(
   }
 
   const tools = languageModelTools.map(toOpenAiToolFromLanguageModelTool);
-  const openAiMessages = withToolUseSystemReminder(messages.flatMap(toOpenAiMessages), tools);
+  const convertedMessages = messages.flatMap(message => toOpenAiMessages(message, settings));
+  const compactedMessages = compactOpenAiMessages(convertedMessages, settings.maxHistoryMessages);
+  const openAiMessages = withToolUseSystemReminder(compactedMessages, tools);
   diag('provider.openai.requestBodySummary', {
     messageRoles: openAiMessages.map(message => message.role),
     messageCount: openAiMessages.length,
+    originalMessageCount: convertedMessages.length,
+    compactedMessageCount: compactedMessages.length,
     toolCount: tools.length,
     tools: tools.map(tool => ({ name: tool.function.name, descriptionSize: tool.function.description.length, schemaSize: sizeOf(tool.function.parameters) }))
   });
@@ -610,6 +616,8 @@ function getSettings(): BridgeSettings {
     model: config.get<string>('model', 'kimi-k2.6'),
     temperature: config.get<number>('temperature', 0.2),
     maxToolRounds: config.get<number>('maxToolRounds', 5),
+    maxHistoryMessages: config.get<number>('maxHistoryMessages', 40),
+    maxToolResultChars: config.get<number>('maxToolResultChars', 8000),
     systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.'),
     diagnosticsEnabled: config.get<boolean>('diagnostics.enabled', false),
     diagnosticsFullPayloads: config.get<boolean>('diagnostics.fullPayloads', false),
@@ -1130,7 +1138,7 @@ async function invokeVsCodeTool(
   }
 }
 
-function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): OpenAiMessage[] {
+function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage, settings: BridgeSettings): OpenAiMessage[] {
   const role: ChatRole = message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user';
   const textParts: string[] = [];
   const toolCalls: ToolCall[] = [];
@@ -1156,7 +1164,7 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): Open
     }
 
     if (part instanceof vscode.LanguageModelToolResultPart) {
-      const content = stringifyToolResult(part.content);
+      const content = truncateText(stringifyToolResult(part.content), settings.maxToolResultChars, 'tool result');
       diagFull('convert.openai.toolResultPart.full', { callId: part.callId, rawContent: part.content, serializedContent: content });
       toolResults.push({
         role: 'tool',
@@ -1186,6 +1194,58 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): Open
 
   result.push(...toolResults);
   return result;
+}
+
+function compactOpenAiMessages(messages: OpenAiMessage[], maxMessages: number): OpenAiMessage[] {
+  if (maxMessages <= 0 || messages.length <= maxMessages) {
+    return messages;
+  }
+
+  const keepStart = findCompactHistoryStart(messages, Math.max(0, messages.length - maxMessages));
+  const compacted: OpenAiMessage[] = [];
+  const omitted = messages.slice(0, keepStart);
+  compacted.push({
+    role: 'system',
+    content: `[OpenCode Chat Bridge omitted ${omitted.length} older converted messages to keep the tool-calling request responsive. Recent tool calls/results are preserved below.]`
+  });
+
+  for (let index = keepStart; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role === 'tool' && !hasPriorToolCallInMessages(messages, keepStart, index, message.tool_call_id)) {
+      compacted.push({
+        role: 'user',
+        content: `[Older tool result ${message.tool_call_id ?? '(unknown id)'} omitted because its matching tool call is outside the retained history window.]`
+      });
+      continue;
+    }
+
+    compacted.push(message);
+  }
+
+  return compacted;
+}
+
+function findCompactHistoryStart(messages: OpenAiMessage[], preferredStart: number): number {
+  let start = Math.min(Math.max(0, preferredStart), messages.length);
+  while (start < messages.length && messages[start].role === 'tool') {
+    start++;
+  }
+
+  return start;
+}
+
+function hasPriorToolCallInMessages(messages: OpenAiMessage[], start: number, endExclusive: number, callId: string | undefined): boolean {
+  if (!callId) {
+    return false;
+  }
+
+  for (let index = start; index < endExclusive; index++) {
+    if (messages[index].tool_calls?.some(toolCall => toolCall.id === callId)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestMessage[]): AnthropicRequestMessages {
@@ -1362,6 +1422,14 @@ function stringifyToolResultPart(part: unknown): string {
   }
 
   return safeJsonStringify(part);
+}
+
+function truncateText(value: string, maxChars: number, label: string): string {
+  if (maxChars <= 0 || value.length <= maxChars) {
+    return value;
+  }
+
+  return `${value.slice(0, maxChars)}\n[OpenCode Chat Bridge truncated ${label}: original ${value.length} chars, kept ${maxChars} chars.]`;
 }
 
 function safeJsonStringify(value: unknown): string {
