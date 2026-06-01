@@ -5,6 +5,8 @@ const ZEN_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completio
 const GO_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/completions';
 const GO_MESSAGES_ENDPOINT = 'https://opencode.ai/zen/go/v1/messages';
 
+let diagnostics: BridgeDiagnostics | undefined;
+
 type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 type ModelProtocol = 'openai-chat' | 'anthropic-messages';
 
@@ -50,6 +52,16 @@ type BridgeSettings = {
   temperature: number;
   maxToolRounds: number;
   systemPrompt: string;
+  diagnosticsEnabled: boolean;
+  diagnosticsFullPayloads: boolean;
+  diagnosticsWriteFile: boolean;
+  diagnosticsFile: string;
+};
+
+type BridgeDiagnostics = {
+  channel: vscode.OutputChannel;
+  enabled: () => boolean;
+  log: (message: string, data?: unknown, options?: { full?: boolean }) => void;
 };
 
 type ToolInfo = {
@@ -185,6 +197,9 @@ class OpenCodeBridgeViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand('opencodeChatBridge.showRunHelp');
       } else if (command === 'openSettings') {
         await vscode.commands.executeCommand('workbench.action.openSettings', 'opencodeChatBridge');
+      } else if (command === 'toggleDiagnostics') {
+        await vscode.commands.executeCommand('opencodeChatBridge.toggleDiagnostics');
+        webviewView.webview.html = this.getHtml(webviewView.webview);
       }
     }, undefined, this.context.subscriptions);
   }
@@ -192,6 +207,10 @@ class OpenCodeBridgeViewProvider implements vscode.WebviewViewProvider {
   private getHtml(webview: vscode.Webview): string {
     const nonce = Date.now().toString(36);
     const settings = getSettings();
+    const diagnosticsLabel = settings.diagnosticsEnabled ? 'Disable Full Diagnostics' : 'Enable Full Diagnostics';
+    const diagnosticsStatus = settings.diagnosticsEnabled
+      ? `Full diagnostics are ON. File: ${settings.diagnosticsFile}`
+      : 'Full diagnostics are OFF.';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -216,11 +235,13 @@ class OpenCodeBridgeViewProvider implements vscode.WebviewViewProvider {
   <p>Runs inside VS Code Chat. Do not type bridge commands in the terminal.</p>
   <button data-command="setApiKey">1. Set / Update OpenCode API Key</button>
   <button data-command="openChat">2. Open VS Code Chat</button>
+  <button data-command="toggleDiagnostics">${escapeHtml(diagnosticsLabel)}</button>
   <button class="secondary" data-command="openSettings">Open Bridge Settings</button>
   <button class="secondary" data-command="showRunHelp">Show Run Help</button>
   <div class="box">
     <p><b>Recommended:</b> select an <code>OpenCode Go</code> model such as <code>${escapeHtml(resolveModelInfo(settings.model).name)}</code> in the Chat model picker, then use Agent/Chat normally.</p>
     <p><b>Fallback test:</b> type <code>@opencode hello</code> in Chat.</p>
+    <p><b>Diagnostics:</b> ${escapeHtml(diagnosticsStatus)}</p>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
@@ -234,6 +255,8 @@ class OpenCodeBridgeViewProvider implements vscode.WebviewViewProvider {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  diagnostics = createDiagnostics(context);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('opencodeChatBridge.setApiKey', async () => {
       const apiKey = await vscode.window.showInputBox({
@@ -271,6 +294,22 @@ export function activate(context: vscode.ExtensionContext) {
       } else if (choice === 'Open Chat') {
         await vscode.commands.executeCommand('opencodeChatBridge.openChat');
       }
+    }),
+    vscode.commands.registerCommand('opencodeChatBridge.toggleDiagnostics', async () => {
+      const config = vscode.workspace.getConfiguration('opencodeChatBridge');
+      const enabled = config.get<boolean>('diagnostics.enabled', false);
+
+      if (enabled) {
+        await config.update('diagnostics.enabled', false, vscode.ConfigurationTarget.Workspace);
+        vscode.window.showInformationMessage('OpenCode Chat Bridge diagnostics disabled.');
+        return;
+      }
+
+      await config.update('diagnostics.enabled', true, vscode.ConfigurationTarget.Workspace);
+      await config.update('diagnostics.fullPayloads', true, vscode.ConfigurationTarget.Workspace);
+      await config.update('diagnostics.writeFile', true, vscode.ConfigurationTarget.Workspace);
+      await config.update('diagnostics.file', '.opencode-chat-bridge/diagnostics.jsonl', vscode.ConfigurationTarget.Workspace);
+      vscode.window.showInformationMessage('OpenCode Chat Bridge full diagnostics enabled. Model responses, tool calls, and tool results will be written to .opencode-chat-bridge/diagnostics.jsonl. API keys are still redacted.');
     })
   );
 
@@ -338,6 +377,18 @@ async function handleChatRequest(
   ];
 
   stream.progress(`Using ${settings.model}${availableTools.length ? ` with ${availableTools.length} VS Code tool(s)` : ''}.`);
+  diag('participant.request', {
+    model: settings.model,
+    endpoint: settings.endpoint,
+    toolCount: availableTools.length,
+    tools: availableTools.map(tool => tool.name),
+    promptSize: request.prompt.length
+  });
+  diagFull('participant.request.full', {
+    prompt: request.prompt,
+    references: request.references.map(describeReference),
+    tools: availableTools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
+  });
 
   for (let round = 0; round <= settings.maxToolRounds; round++) {
     throwIfCancelled(token);
@@ -374,7 +425,9 @@ async function handleChatRequest(
     for (const toolCall of toolCalls) {
       throwIfCancelled(token);
       stream.progress(`Running VS Code tool: ${toolCall.function.name}`);
+      diagFull('participant.toolCall.full', toolCall);
       const result = await invokeVsCodeTool(toolCall, availableTools, request.toolInvocationToken, token);
+      diagFull('participant.toolResult.full', { callId: toolCall.id, name: toolCall.function.name, result });
       messages.push({
         role: 'tool',
         tool_call_id: toolCall.id,
@@ -405,9 +458,26 @@ async function provideOpenCodeLanguageModelResponse(
   const languageModelTools = options.tools ?? [];
   const toolNameMap = new Map(languageModelTools.map(tool => [sanitizeToolName(tool.name), tool.name]));
 
+  diag('provider.request', {
+    modelId: modelInfo.id,
+    protocol: modelInfo.protocol,
+    messageCount: messages.length,
+    toolCount: languageModelTools.length,
+    toolMode: String(options.toolMode),
+    tools: languageModelTools.map(tool => ({ name: tool.name, sanitized: sanitizeToolName(tool.name), schemaSize: sizeOf(tool.inputSchema) }))
+  });
+
   if (modelInfo.protocol === 'anthropic-messages') {
     const anthropicMessages = toAnthropicMessages(messages);
     const tools = languageModelTools.map(toAnthropicToolFromLanguageModelTool);
+    diag('provider.anthropic.requestBodySummary', {
+      systemCount: anthropicMessages.system.length,
+      messageRoles: anthropicMessages.messages.map(message => message.role),
+      contentTypes: anthropicMessages.messages.map(message => message.content.map(part => part.type)),
+      tools: tools.map(tool => ({ name: tool.name, descriptionSize: tool.description.length, schemaSize: sizeOf(tool.input_schema) }))
+    });
+    diagFull('provider.anthropic.messages.full', anthropicMessages);
+    diagFull('provider.anthropic.tools.full', tools);
     const response = await callAnthropicMessages(modelInfo, settings, apiKey, anthropicMessages, tools, token, {
       toolChoice: toAnthropicToolChoice(options.toolMode)
     });
@@ -416,13 +486,23 @@ async function provideOpenCodeLanguageModelResponse(
       throw new Error('No assistant content was returned by OpenCode Go.');
     }
 
+    diagFull('model.anthropic.rawResponse.full', response);
+
     for (const block of response.content) {
       if (block?.type === 'text' && typeof block.text === 'string') {
+        diag('provider.anthropic.text', { size: block.text.length });
         progress.report(new vscode.LanguageModelTextPart(block.text));
       }
 
       if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         const originalToolName = toolNameMap.get(block.name) ?? block.name;
+        diag('provider.anthropic.toolCall', {
+          callId: block.id,
+          modelToolName: block.name,
+          originalToolName,
+          inputSize: sizeOf(block.input)
+        });
+        diagFull('provider.anthropic.toolCall.full', { block, originalToolName, parsedInput: parseToolInput(block.input) });
         progress.report(new vscode.LanguageModelToolCallPart(
           block.id,
           originalToolName,
@@ -436,6 +516,14 @@ async function provideOpenCodeLanguageModelResponse(
 
   const openAiMessages = messages.flatMap(toOpenAiMessages);
   const tools = languageModelTools.map(toOpenAiToolFromLanguageModelTool);
+  diag('provider.openai.requestBodySummary', {
+    messageRoles: openAiMessages.map(message => message.role),
+    messageCount: openAiMessages.length,
+    toolCount: tools.length,
+    tools: tools.map(tool => ({ name: tool.function.name, descriptionSize: tool.function.description.length, schemaSize: sizeOf(tool.function.parameters) }))
+  });
+  diagFull('provider.openai.messages.full', openAiMessages);
+  diagFull('provider.openai.tools.full', tools);
   const response = await callChatCompletions(
     { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
     apiKey,
@@ -453,12 +541,23 @@ async function provideOpenCodeLanguageModelResponse(
     throw new Error('No assistant message was returned by OpenCode.');
   }
 
+  diagFull('model.openai.rawResponse.full', response);
+  diagFull('model.openai.assistantMessage.full', assistantMessage);
+
   if (assistantMessage.content) {
+    diag('provider.openai.text', { size: assistantMessage.content.length });
     progress.report(new vscode.LanguageModelTextPart(assistantMessage.content));
   }
 
   for (const toolCall of assistantMessage.tool_calls ?? []) {
     const originalToolName = toolNameMap.get(toolCall.function.name) ?? toolCall.function.name;
+    diag('provider.openai.toolCall', {
+      callId: toolCall.id,
+      modelToolName: toolCall.function.name,
+      originalToolName,
+      argumentsSize: sizeOf(toolCall.function.arguments)
+    });
+    diagFull('provider.openai.toolCall.full', { toolCall, originalToolName, parsedInput: parseToolArguments(toolCall.function.arguments) });
     progress.report(new vscode.LanguageModelToolCallPart(
       toolCall.id || `call_${Date.now().toString(36)}`,
       originalToolName,
@@ -480,8 +579,144 @@ function getSettings(): BridgeSettings {
     model: config.get<string>('model', 'kimi-k2.6'),
     temperature: config.get<number>('temperature', 0.2),
     maxToolRounds: config.get<number>('maxToolRounds', 5),
-    systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.')
+    systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.'),
+    diagnosticsEnabled: config.get<boolean>('diagnostics.enabled', false),
+    diagnosticsFullPayloads: config.get<boolean>('diagnostics.fullPayloads', false),
+    diagnosticsWriteFile: config.get<boolean>('diagnostics.writeFile', false),
+    diagnosticsFile: config.get<string>('diagnostics.file', '.opencode-chat-bridge/diagnostics.jsonl')
   };
+}
+
+function createDiagnostics(context: vscode.ExtensionContext): BridgeDiagnostics {
+  const channel = vscode.window.createOutputChannel('OpenCode Chat Bridge');
+  context.subscriptions.push(channel);
+
+  return {
+    channel,
+    enabled: () => getSettings().diagnosticsEnabled,
+    log: (message, data, options) => {
+      const settings = getSettings();
+      if (!settings.diagnosticsEnabled) {
+        return;
+      }
+
+      const full = Boolean(options?.full && settings.diagnosticsFullPayloads);
+      const payload = full
+        ? redactSecrets(data)
+        : sanitizeDiagnosticData(data);
+      const suffix = data !== undefined ? ` ${safeJsonStringify(payload)}` : '';
+      const timestamp = new Date().toISOString();
+      channel.appendLine(`[${timestamp}] ${message}${suffix}`);
+      void writeDiagnosticFile(settings, {
+        timestamp,
+        event: message,
+        full,
+        data: payload
+      });
+    }
+  };
+}
+
+async function writeDiagnosticFile(settings: BridgeSettings, entry: Record<string, unknown>): Promise<void> {
+  if (!settings.diagnosticsWriteFile) {
+    return;
+  }
+
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) {
+    return;
+  }
+
+  const relativePath = settings.diagnosticsFile.trim() || '.opencode-chat-bridge/diagnostics.jsonl';
+  const safeRelativePath = relativePath.replace(/^[/\\]+/, '');
+  const segments = safeRelativePath.split(/[\\/]+/).filter(Boolean);
+  const target = vscode.Uri.joinPath(folder.uri, ...segments);
+  const parent = vscode.Uri.joinPath(folder.uri, ...segments.slice(0, -1));
+
+  try {
+    await vscode.workspace.fs.createDirectory(parent);
+    const line = `${safeJsonStringify(entry)}\n`;
+    const existing = await readExistingDiagnosticFile(target);
+    await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(`${existing}${line}`));
+  } catch (error) {
+    diagnostics?.channel.appendLine(`[${new Date().toISOString()}] diagnostics.writeFile.error ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function readExistingDiagnosticFile(uri: vscode.Uri): Promise<string> {
+  try {
+    return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+  } catch {
+    return '';
+  }
+}
+
+function diag(message: string, data?: unknown, options?: { full?: boolean }): void {
+  diagnostics?.log(message, data, options);
+}
+
+function diagFull(message: string, data?: unknown): void {
+  diagnostics?.log(message, data, { full: true });
+}
+
+function sanitizeDiagnosticData(value: unknown): unknown {
+  if (value === undefined || value === null) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return value.length > 300 ? `${value.slice(0, 300)}...[${value.length} chars]` : value;
+  }
+
+  if (typeof value !== 'object') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map(sanitizeDiagnosticData);
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/api|key|token|authorization|secret|prompt|content|text/i.test(key)) {
+      result[key] = `[redacted:${sizeOf(entry)}]`;
+    } else {
+      result[key] = sanitizeDiagnosticData(entry);
+    }
+  }
+  return result;
+}
+
+function redactSecrets(value: unknown): unknown {
+  if (value === undefined || value === null) {
+    return value;
+  }
+
+  if (typeof value !== 'object') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(redactSecrets);
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/api[_-]?key|x-api-key|authorization|bearer|secret|token/i.test(key)) {
+      result[key] = '[redacted]';
+    } else {
+      result[key] = redactSecrets(entry);
+    }
+  }
+  return result;
+}
+
+function sizeOf(value: unknown): number {
+  if (typeof value === 'string') {
+    return value.length;
+  }
+
+  return safeJsonStringify(value).length;
 }
 
 function resolveModelInfo(id: string): OpenCodeModelInfo {
@@ -641,6 +876,11 @@ async function callChatCompletions(
       }
     }
 
+    diagFull('http.openai.request.full', {
+      endpoint: settings.endpoint,
+      body
+    });
+
     const response = await fetch(settings.endpoint, {
       method: 'POST',
       headers: {
@@ -652,6 +892,8 @@ async function callChatCompletions(
     });
 
     const text = await response.text();
+    diag('http.openai.response', { status: response.status, ok: response.ok, bodySize: text.length });
+    diagFull('http.openai.response.full', { status: response.status, ok: response.ok, statusText: response.statusText, body: text });
     let parsed: ChatCompletionResponse;
     try {
       parsed = text ? JSON.parse(text) as ChatCompletionResponse : {};
@@ -667,6 +909,9 @@ async function callChatCompletions(
     if (parsed.error) {
       throw new Error(parsed.error.message ?? JSON.stringify(parsed.error));
     }
+
+    diagFull('http.openai.parsed.full', parsed);
+    diagFull('model.openai.httpParsedResponse.full', parsed);
 
     return parsed;
   } finally {
@@ -706,6 +951,11 @@ async function callAnthropicMessages(
       }
     }
 
+    diagFull('http.anthropic.request.full', {
+      endpoint: modelInfo.endpoint,
+      body
+    });
+
     const response = await fetch(modelInfo.endpoint, {
       method: 'POST',
       headers: {
@@ -718,6 +968,8 @@ async function callAnthropicMessages(
     });
 
     const text = await response.text();
+    diag('http.anthropic.response', { status: response.status, ok: response.ok, bodySize: text.length });
+    diagFull('http.anthropic.response.full', { status: response.status, ok: response.ok, statusText: response.statusText, body: text });
     let parsed: AnthropicResponse;
     try {
       parsed = text ? JSON.parse(text) as AnthropicResponse : {};
@@ -733,6 +985,9 @@ async function callAnthropicMessages(
     if (parsed.error) {
       throw new Error(parsed.error.message ?? JSON.stringify(parsed.error));
     }
+
+    diagFull('http.anthropic.parsed.full', parsed);
+    diagFull('model.anthropic.httpParsedResponse.full', parsed);
 
     return parsed;
   } finally {
@@ -755,6 +1010,7 @@ async function invokeVsCodeTool(
   try {
     input = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
   } catch (error) {
+    diagFull('participant.invokeTool.parseError.full', { toolCall, error: error instanceof Error ? error.message : String(error) });
     return JSON.stringify({ error: `Invalid tool arguments JSON: ${error instanceof Error ? error.message : String(error)}` });
   }
 
@@ -767,9 +1023,13 @@ async function invokeVsCodeTool(
   }
 
   try {
+    diagFull('participant.invokeTool.input.full', { toolName: tool.name, input });
     const result = await lmAny.invokeTool(tool.name, { input, toolInvocationToken }, token);
-    return stringifyToolResult(result);
+    const serialized = stringifyToolResult(result);
+    diagFull('participant.invokeTool.result.full', { toolName: tool.name, rawResult: result, serializedResult: serialized });
+    return serialized;
   } catch (error) {
+    diagFull('participant.invokeTool.error.full', { toolName: tool.name, error: error instanceof Error ? error.message : String(error) });
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
 }
@@ -787,6 +1047,7 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): Open
     }
 
     if (part instanceof vscode.LanguageModelToolCallPart) {
+      diagFull('convert.openai.toolCallPart.full', { callId: part.callId, name: part.name, input: part.input });
       toolCalls.push({
         id: part.callId,
         type: 'function',
@@ -799,10 +1060,12 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): Open
     }
 
     if (part instanceof vscode.LanguageModelToolResultPart) {
+      const content = stringifyToolResult(part.content);
+      diagFull('convert.openai.toolResultPart.full', { callId: part.callId, rawContent: part.content, serializedContent: content });
       toolResults.push({
         role: 'tool',
         tool_call_id: part.callId,
-        content: stringifyToolResult(part.content)
+        content
       });
       continue;
     }
@@ -845,6 +1108,7 @@ function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestM
       }
 
       if (part instanceof vscode.LanguageModelToolCallPart) {
+        diagFull('convert.anthropic.toolCallPart.full', { callId: part.callId, name: part.name, input: part.input });
         content.push({
           type: 'tool_use',
           id: part.callId,
@@ -855,10 +1119,12 @@ function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestM
       }
 
       if (part instanceof vscode.LanguageModelToolResultPart) {
+        const content = stringifyToolResult(part.content);
+        diagFull('convert.anthropic.toolResultPart.full', { callId: part.callId, rawContent: part.content, serializedContent: content });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: part.callId,
-          content: stringifyToolResult(part.content)
+          content
         });
         continue;
       }

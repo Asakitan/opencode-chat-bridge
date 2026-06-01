@@ -2,5 +2,7 @@ node_modules/
 dist/
 *.vsix
 npm-*.log
+.task-*.log
+.opencode-chat-bridge/
 .env
 .DS_Store

@@ -68,6 +68,10 @@
       {
         "command": "opencodeChatBridge.showRunHelp",
         "title": "OpenCode Chat Bridge: Show Run Help"
+      },
+      {
+        "command": "opencodeChatBridge.toggleDiagnostics",
+        "title": "OpenCode Chat Bridge: Toggle Full Diagnostics"
       }
     ],
     "configuration": {
@@ -151,6 +155,26 @@
           "type": "string",
           "default": "You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.",
           "markdownDescription": "System prompt sent before the user request for fallback `@opencode` and direct provider requests. Leave default unless you need custom behavior."
+        },
+        "opencodeChatBridge.diagnostics.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable OpenCode Chat Bridge diagnostics in the `OpenCode Chat Bridge` output channel."
+        },
+        "opencodeChatBridge.diagnostics.fullPayloads": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Log full bridge payloads for diagnosing tool-call loops. API keys and authorization headers are still redacted."
+        },
+        "opencodeChatBridge.diagnostics.writeFile": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Write diagnostics to a JSONL file in the current workspace so the file can be inspected later."
+        },
+        "opencodeChatBridge.diagnostics.file": {
+          "type": "string",
+          "default": ".opencode-chat-bridge/diagnostics.jsonl",
+          "markdownDescription": "Workspace-relative diagnostics JSONL path used when `opencodeChatBridge.diagnostics.writeFile` is enabled."
         }
       }
     }
