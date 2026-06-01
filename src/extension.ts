@@ -527,8 +527,8 @@ async function provideOpenCodeLanguageModelResponse(
     return;
   }
 
-  const openAiMessages = messages.flatMap(toOpenAiMessages);
   const tools = languageModelTools.map(toOpenAiToolFromLanguageModelTool);
+  const openAiMessages = withToolUseSystemReminder(messages.flatMap(toOpenAiMessages), tools);
   diag('provider.openai.requestBodySummary', {
     messageRoles: openAiMessages.map(message => message.role),
     messageCount: openAiMessages.length,
@@ -558,36 +558,10 @@ async function provideOpenCodeLanguageModelResponse(
   diagFull('model.openai.assistantMessage.full', assistantMessage);
 
   if (shouldRetryMissingToolCall(assistantMessage, tools)) {
-    diag('provider.openai.missingToolCallRetry', {
+    diag('provider.openai.missingToolCallDetected', {
       contentSize: assistantMessage.content?.length ?? 0,
       toolCount: tools.length
     });
-    const originalAssistantMessage = assistantMessage;
-
-    try {
-      response = await callChatCompletions(
-        { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
-        apiKey,
-        buildMissingToolCallRetryMessages(openAiMessages, assistantMessage),
-        tools,
-        token,
-        {
-          toolChoice: 'auto',
-          stream: false
-        }
-      );
-
-      assistantMessage = response.choices?.[0]?.message;
-      if (!assistantMessage) {
-        throw new Error('No assistant message was returned by OpenCode after forcing a tool call retry.');
-      }
-
-      diagFull('model.openai.retryRawResponse.full', response);
-      diagFull('model.openai.retryAssistantMessage.full', assistantMessage);
-    } catch (error) {
-      diag('provider.openai.missingToolCallRetry.failed', { error: error instanceof Error ? error.message : String(error) });
-      assistantMessage = originalAssistantMessage;
-    }
   }
 
   if (assistantMessage.content) {
@@ -630,20 +604,6 @@ function shouldRetryMissingToolCall(assistantMessage: OpenAiMessage, tools: Open
 
   return /\b(use|call|invoke|run|execute|create|write|edit|modify|patch|read|search|inspect|check|list|apply)\b/.test(content)
     || /立刻|马上|直接|创建|写入|修改|编辑|读取|查看|搜索|执行|运行|调用|工具|动手|爪爪/.test(content);
-}
-
-function buildMissingToolCallRetryMessages(messages: OpenAiMessage[], assistantMessage: OpenAiMessage): OpenAiMessage[] {
-  return [
-    ...messages,
-    {
-      role: 'assistant',
-      content: assistantMessage.content ?? ''
-    },
-    {
-      role: 'user',
-      content: 'You just said you would take action, but you did not emit a tool call. Use one of the provided tools now. Do not answer with prose unless no tool can possibly help.'
-    }
-  ];
 }
 
 function getSettings(): BridgeSettings {
@@ -924,6 +884,20 @@ function toOpenAiToolChoice(mode: vscode.LanguageModelChatToolMode): unknown {
   return 'auto';
 }
 
+function withToolUseSystemReminder(messages: OpenAiMessage[], tools: OpenAiTool[]): OpenAiMessage[] {
+  if (!tools.length) {
+    return messages;
+  }
+
+  return [
+    {
+      role: 'system',
+      content: 'Tool protocol reminder: when you decide to read files, inspect the workspace, run commands, create files, edit files, or otherwise take an action, you MUST emit a tool call in the OpenAI tools/tool_calls format. Do not merely say you will do it. Only answer with prose when no available tool can help or after tool results have been provided.'
+    },
+    ...messages
+  ];
+}
+
 function toAnthropicToolChoice(mode: vscode.LanguageModelChatToolMode): unknown {
   if (mode === vscode.LanguageModelChatToolMode.Required) {
     return { type: 'any' };
@@ -1174,7 +1148,7 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): Open
     }
 
     if (part instanceof vscode.LanguageModelDataPart) {
-      textParts.push(`[${part.mimeType} data omitted: OpenCode Zen chat completions bridge currently forwards text and tool parts only.]`);
+      diag('convert.openai.dataPart.omitted', { mimeType: part.mimeType });
       continue;
     }
 
@@ -1233,7 +1207,7 @@ function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestM
       }
 
       if (part instanceof vscode.LanguageModelDataPart) {
-        content.push({ type: 'text', text: `[${part.mimeType} data omitted: OpenCode Go bridge currently forwards text and tool parts only.]` });
+        diag('convert.anthropic.dataPart.omitted', { mimeType: part.mimeType });
         continue;
       }
 
