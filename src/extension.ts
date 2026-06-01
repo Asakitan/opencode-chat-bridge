@@ -526,7 +526,7 @@ async function provideOpenCodeLanguageModelResponse(
   });
   diagFull('provider.openai.messages.full', openAiMessages);
   diagFull('provider.openai.tools.full', tools);
-  const response = await callChatCompletions(
+  let response = await callChatCompletions(
     { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
     apiKey,
     openAiMessages,
@@ -538,13 +538,46 @@ async function provideOpenCodeLanguageModelResponse(
     }
   );
 
-  const assistantMessage = response.choices?.[0]?.message;
+  let assistantMessage = response.choices?.[0]?.message;
   if (!assistantMessage) {
     throw new Error('No assistant message was returned by OpenCode.');
   }
 
   diagFull('model.openai.rawResponse.full', response);
   diagFull('model.openai.assistantMessage.full', assistantMessage);
+
+  if (shouldRetryMissingToolCall(assistantMessage, tools)) {
+    diag('provider.openai.missingToolCallRetry', {
+      contentSize: assistantMessage.content?.length ?? 0,
+      toolCount: tools.length
+    });
+    const originalAssistantMessage = assistantMessage;
+
+    try {
+      response = await callChatCompletions(
+        { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
+        apiKey,
+        buildMissingToolCallRetryMessages(openAiMessages, assistantMessage),
+        tools,
+        token,
+        {
+          toolChoice: 'required',
+          stream: false
+        }
+      );
+
+      assistantMessage = response.choices?.[0]?.message;
+      if (!assistantMessage) {
+        throw new Error('No assistant message was returned by OpenCode after forcing a tool call retry.');
+      }
+
+      diagFull('model.openai.retryRawResponse.full', response);
+      diagFull('model.openai.retryAssistantMessage.full', assistantMessage);
+    } catch (error) {
+      diag('provider.openai.missingToolCallRetry.failed', { error: error instanceof Error ? error.message : String(error) });
+      assistantMessage = originalAssistantMessage;
+    }
+  }
 
   if (assistantMessage.content) {
     diag('provider.openai.text', { size: assistantMessage.content.length });
@@ -572,6 +605,34 @@ function throwIfCancelled(token: vscode.CancellationToken) {
   if (token.isCancellationRequested) {
     throw new Error('Request cancelled.');
   }
+}
+
+function shouldRetryMissingToolCall(assistantMessage: OpenAiMessage, tools: OpenAiTool[]): boolean {
+  if (!tools.length || assistantMessage.tool_calls?.length) {
+    return false;
+  }
+
+  const content = (assistantMessage.content ?? '').toLowerCase();
+  if (!content.trim()) {
+    return false;
+  }
+
+  return /\b(use|call|invoke|run|execute|create|write|edit|modify|patch|read|search|inspect|check|list|apply)\b/.test(content)
+    || /立刻|马上|直接|创建|写入|修改|编辑|读取|查看|搜索|执行|运行|调用|工具|动手|爪爪/.test(content);
+}
+
+function buildMissingToolCallRetryMessages(messages: OpenAiMessage[], assistantMessage: OpenAiMessage): OpenAiMessage[] {
+  return [
+    ...messages,
+    {
+      role: 'assistant',
+      content: assistantMessage.content ?? ''
+    },
+    {
+      role: 'user',
+      content: 'You just said you would take action, but you did not emit a tool call. Use one of the provided tools now. Do not answer with prose unless no tool can possibly help.'
+    }
+  ];
 }
 
 function getSettings(): BridgeSettings {
