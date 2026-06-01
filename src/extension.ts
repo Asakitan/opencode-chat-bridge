@@ -562,6 +562,8 @@ async function provideOpenCodeLanguageModelResponse(
       contentSize: assistantMessage.content?.length ?? 0,
       toolCount: tools.length
     });
+    progress.report(new vscode.LanguageModelTextPart('OpenCode returned action-oriented text without a tool call, so VS Code cannot execute it. Try again or use a different OpenCode model that follows OpenAI tool_calls for tool use.'));
+    return;
   }
 
   if (assistantMessage.content) {
@@ -598,12 +600,7 @@ function shouldRetryMissingToolCall(assistantMessage: OpenAiMessage, tools: Open
   }
 
   const content = (assistantMessage.content ?? '').toLowerCase();
-  if (!content.trim()) {
-    return false;
-  }
-
-  return /\b(use|call|invoke|run|execute|create|write|edit|modify|patch|read|search|inspect|check|list|apply)\b/.test(content)
-    || /立刻|马上|直接|创建|写入|修改|编辑|读取|查看|搜索|执行|运行|调用|工具|动手|爪爪/.test(content);
+  return looksLikeActionWithoutToolCall(content);
 }
 
 function getSettings(): BridgeSettings {
@@ -889,13 +886,35 @@ function withToolUseSystemReminder(messages: OpenAiMessage[], tools: OpenAiTool[
     return messages;
   }
 
+  const sanitizedMessages = messages.filter(message => {
+    if (message.role !== 'assistant' || message.tool_calls?.length) {
+      return true;
+    }
+
+    return !looksLikeActionWithoutToolCall(message.content ?? '');
+  });
+
   return [
     {
       role: 'system',
       content: 'Tool protocol reminder: when you decide to read files, inspect the workspace, run commands, create files, edit files, or otherwise take an action, you MUST emit a tool call in the OpenAI tools/tool_calls format. Do not merely say you will do it. Only answer with prose when no available tool can help or after tool results have been provided.'
     },
-    ...messages
+    ...sanitizedMessages,
+    {
+      role: 'user',
+      content: 'Protocol check for the current request: if you need to inspect, read, list, search, download, run, create, edit, patch, or analyze files/data using available tools, your next assistant message MUST contain tool_calls and no action-promising prose. If no tool is needed, answer only with final conclusions based on already completed tool results.'
+    }
   ];
+}
+
+function looksLikeActionWithoutToolCall(content: string): boolean {
+  const trimmed = content.trim().toLowerCase();
+  if (!trimmed) {
+    return false;
+  }
+
+  return /\b(use|call|invoke|run|execute|create|write|edit|modify|patch|read|search|inspect|check|list|apply|download|analyze)\b/.test(trimmed)
+    || /立刻|马上|直接|创建|写入|修改|编辑|读取|查看|搜索|执行|运行|调用|工具|动手|爪爪|拉下来|拉取|下载|分析|检查|看看/.test(trimmed);
 }
 
 function toAnthropicToolChoice(mode: vscode.LanguageModelChatToolMode): unknown {
