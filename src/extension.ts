@@ -1,5 +1,16 @@
 import * as vscode from 'vscode';
 
+declare const require: (moduleName: string) => unknown;
+
+const nodeFs = require('fs/promises') as {
+  mkdir(path: string, options: { recursive: boolean }): Promise<void>;
+  appendFile(path: string, data: string, encoding: BufferEncoding): Promise<void>;
+};
+const nodePath = require('path') as {
+  dirname(path: string): string;
+};
+type BufferEncoding = 'utf8';
+
 const SECRET_KEY = 'opencodeChatBridge.apiKey';
 const ZEN_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completions';
 const GO_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/completions';
@@ -561,7 +572,7 @@ async function provideOpenCodeLanguageModelResponse(
         tools,
         token,
         {
-          toolChoice: 'required',
+          toolChoice: 'auto',
           stream: false
         }
       );
@@ -667,7 +678,9 @@ function createDiagnostics(context: vscode.ExtensionContext): BridgeDiagnostics 
       const payload = full
         ? redactSecrets(data)
         : sanitizeDiagnosticData(data);
-      const suffix = data !== undefined ? ` ${safeJsonStringify(payload)}` : '';
+      const suffix = data !== undefined
+        ? (full && settings.diagnosticsWriteFile ? ' [full payload written to diagnostics file]' : ` ${safeJsonStringify(payload)}`)
+        : '';
       const timestamp = new Date().toISOString();
       channel.appendLine(`[${timestamp}] ${message}${suffix}`);
       enqueueDiagnosticFileWrite(settings, {
@@ -702,11 +715,17 @@ async function writeDiagnosticFile(settings: BridgeSettings, entry: Record<strin
   const safeRelativePath = relativePath.replace(/^[/\\]+/, '');
   const segments = safeRelativePath.split(/[\\/]+/).filter(Boolean);
   const target = vscode.Uri.joinPath(folder.uri, ...segments);
-  const parent = vscode.Uri.joinPath(folder.uri, ...segments.slice(0, -1));
 
   try {
-    await vscode.workspace.fs.createDirectory(parent);
     const line = `${JSON.stringify(entry)}\n`;
+    if (target.scheme === 'file') {
+      await nodeFs.mkdir(nodePath.dirname(target.fsPath), { recursive: true });
+      await nodeFs.appendFile(target.fsPath, line, 'utf8');
+      return;
+    }
+
+    const parent = vscode.Uri.joinPath(folder.uri, ...segments.slice(0, -1));
+    await vscode.workspace.fs.createDirectory(parent);
     const existing = await readExistingDiagnosticFile(target);
     await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(`${existing}${line}`));
   } catch (error) {
