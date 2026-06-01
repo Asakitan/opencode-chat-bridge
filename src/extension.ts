@@ -4,7 +4,6 @@ const SECRET_KEY = 'opencodeChatBridge.apiKey';
 const ZEN_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completions';
 const GO_CHAT_COMPLETIONS_ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/completions';
 const GO_MESSAGES_ENDPOINT = 'https://opencode.ai/zen/go/v1/messages';
-const DEFAULT_MAX_TOOL_RESULT_CHARS = 12000;
 
 type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 type ModelProtocol = 'openai-chat' | 'anthropic-messages';
@@ -50,7 +49,6 @@ type BridgeSettings = {
   model: string;
   temperature: number;
   maxToolRounds: number;
-  maxToolResultChars: number;
   systemPrompt: string;
 };
 
@@ -376,7 +374,7 @@ async function handleChatRequest(
     for (const toolCall of toolCalls) {
       throwIfCancelled(token);
       stream.progress(`Running VS Code tool: ${toolCall.function.name}`);
-      const result = await invokeVsCodeTool(toolCall, availableTools, request.toolInvocationToken, settings, token);
+      const result = await invokeVsCodeTool(toolCall, availableTools, request.toolInvocationToken, token);
       messages.push({
         role: 'tool',
         tool_call_id: toolCall.id,
@@ -408,7 +406,7 @@ async function provideOpenCodeLanguageModelResponse(
   const toolNameMap = new Map(languageModelTools.map(tool => [sanitizeToolName(tool.name), tool.name]));
 
   if (modelInfo.protocol === 'anthropic-messages') {
-    const anthropicMessages = toAnthropicMessages(messages, settings);
+    const anthropicMessages = toAnthropicMessages(messages);
     const tools = languageModelTools.map(toAnthropicToolFromLanguageModelTool);
     const response = await callAnthropicMessages(modelInfo, settings, apiKey, anthropicMessages, tools, token, {
       toolChoice: toAnthropicToolChoice(options.toolMode)
@@ -436,7 +434,7 @@ async function provideOpenCodeLanguageModelResponse(
     return;
   }
 
-  const openAiMessages = messages.flatMap(message => toOpenAiMessages(message, settings));
+  const openAiMessages = messages.flatMap(toOpenAiMessages);
   const tools = languageModelTools.map(toOpenAiToolFromLanguageModelTool);
   const response = await callChatCompletions(
     { ...settings, endpoint: modelInfo.endpoint, model: modelInfo.id },
@@ -482,7 +480,6 @@ function getSettings(): BridgeSettings {
     model: config.get<string>('model', 'kimi-k2.6'),
     temperature: config.get<number>('temperature', 0.2),
     maxToolRounds: config.get<number>('maxToolRounds', 5),
-    maxToolResultChars: config.get<number>('maxToolResultChars', DEFAULT_MAX_TOOL_RESULT_CHARS),
     systemPrompt: config.get<string>('systemPrompt', 'You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.')
   };
 }
@@ -747,7 +744,6 @@ async function invokeVsCodeTool(
   toolCall: ToolCall,
   tools: ToolInfo[],
   toolInvocationToken: vscode.ChatParticipantToolToken | undefined,
-  settings: BridgeSettings,
   token: vscode.CancellationToken
 ): Promise<string> {
   const tool = findToolByCallName(toolCall.function.name, tools);
@@ -772,13 +768,13 @@ async function invokeVsCodeTool(
 
   try {
     const result = await lmAny.invokeTool(tool.name, { input, toolInvocationToken }, token);
-    return stringifyToolResult(result, settings);
+    return stringifyToolResult(result);
   } catch (error) {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage, settings: BridgeSettings): OpenAiMessage[] {
+function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage): OpenAiMessage[] {
   const role: ChatRole = message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user';
   const textParts: string[] = [];
   const toolCalls: ToolCall[] = [];
@@ -806,7 +802,7 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage, setti
       toolResults.push({
         role: 'tool',
         tool_call_id: part.callId,
-        content: stringifyToolResult(part.content, settings)
+        content: stringifyToolResult(part.content)
       });
       continue;
     }
@@ -833,7 +829,7 @@ function toOpenAiMessages(message: vscode.LanguageModelChatRequestMessage, setti
   return result;
 }
 
-function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestMessage[], settings: BridgeSettings): AnthropicRequestMessages {
+function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestMessage[]): AnthropicRequestMessages {
   const system: string[] = [];
   const result: AnthropicMessage[] = [];
 
@@ -862,7 +858,7 @@ function toAnthropicMessages(messages: readonly vscode.LanguageModelChatRequestM
         toolResults.push({
           type: 'tool_result',
           tool_use_id: part.callId,
-          content: stringifyToolResult(part.content, settings)
+          content: stringifyToolResult(part.content)
         });
         continue;
       }
@@ -960,62 +956,50 @@ function estimateTokenCount(text: string | vscode.LanguageModelChatRequestMessag
   return Math.max(1, Math.ceil(content.length / 4));
 }
 
-function stringifyToolResult(result: unknown, settings?: BridgeSettings): string {
-  const maxChars = Math.max(1000, settings?.maxToolResultChars ?? DEFAULT_MAX_TOOL_RESULT_CHARS);
+function stringifyToolResult(result: unknown): string {
   if (result === undefined || result === null) {
     return '(tool returned empty result)';
   }
 
   if (typeof result === 'string') {
-    return clampToolResult(result.trim() ? result : '(tool returned empty result)', maxChars);
+    return result.trim() ? result : '(tool returned empty result)';
   }
 
   if (result && typeof result === 'object') {
     const maybeContent = result as { content?: unknown; value?: unknown };
     if (Array.isArray(maybeContent.content)) {
-      const content = maybeContent.content.map(part => stringifyToolResultPart(part, maxChars)).filter(Boolean).join('\n');
-      return clampToolResult(content.trim() ? content : '(tool returned empty result)', maxChars);
+      const content = maybeContent.content.map(part => stringifyToolResultPart(part)).filter(Boolean).join('\n');
+      return content.trim() ? content : '(tool returned empty result)';
     }
 
     if (maybeContent.value !== undefined) {
-      return stringifyToolResult(maybeContent.value, settings);
+      return stringifyToolResult(maybeContent.value);
     }
   }
 
   const serialized = safeJsonStringify(result);
-  return clampToolResult(serialized && serialized !== '{}' && serialized !== '[]' ? serialized : '(tool returned empty result)', maxChars);
+  return serialized && serialized !== '{}' && serialized !== '[]' ? serialized : '(tool returned empty result)';
 }
 
-function stringifyToolResultPart(part: unknown, maxChars = DEFAULT_MAX_TOOL_RESULT_CHARS): string {
+function stringifyToolResultPart(part: unknown): string {
   if (typeof part === 'string') {
-    return clampToolResult(part, maxChars);
+    return part;
   }
 
   if (part && typeof part === 'object') {
     const candidate = part as { value?: unknown; text?: unknown; content?: unknown };
     if (typeof candidate.value === 'string') {
-      return clampToolResult(candidate.value, maxChars);
+      return candidate.value;
     }
     if (typeof candidate.text === 'string') {
-      return clampToolResult(candidate.text, maxChars);
+      return candidate.text;
     }
     if (typeof candidate.content === 'string') {
-      return clampToolResult(candidate.content, maxChars);
+      return candidate.content;
     }
   }
 
-  return clampToolResult(safeJsonStringify(part), maxChars);
-}
-
-function clampToolResult(text: string, maxChars: number): string {
-  if (text.length <= maxChars) {
-    return text;
-  }
-
-  const headSize = Math.floor(maxChars * 0.7);
-  const tailSize = Math.max(0, maxChars - headSize - 180);
-  const omitted = text.length - headSize - tailSize;
-  return `${text.slice(0, headSize)}\n\n[OpenCode Chat Bridge truncated ${omitted} character(s) from this tool result to keep the tool loop connected.]\n\n${tailSize ? text.slice(-tailSize) : ''}`;
+  return safeJsonStringify(part);
 }
 
 function safeJsonStringify(value: unknown): string {
