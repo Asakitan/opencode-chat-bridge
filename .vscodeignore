@@ -4,3 +4,5 @@ src/**
 tsconfig.json
 *.vsix
 node_modules/**
+.task-*.log
+npm-*.log

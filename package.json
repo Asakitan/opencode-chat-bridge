@@ -147,6 +147,13 @@
           "maximum": 20,
           "description": "Maximum tool-call round trips per chat request."
         },
+        "opencodeChatBridge.maxToolResultChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 1000,
+          "maximum": 200000,
+          "description": "Maximum characters from each VS Code tool result sent back to OpenCode. Lower this if file-edit/apply tools disconnect after returning large diffs."
+        },
         "opencodeChatBridge.systemPrompt": {
           "type": "string",
           "default": "You are OpenCode running inside VS Code Chat. Use available tools when helpful. Explain file changes clearly and keep responses concise.",
